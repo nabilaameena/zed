@@ -1,6 +1,6 @@
 use crate::{
-    Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GotoDefinitionKind,
-    HighlightKey, Navigated, PointForPosition, SelectPhase,
+    Anchor, DisplayPoint, Editor, EditorSettings, EditorSnapshot, FindAllReferences,
+    GotoDefinitionKind, HighlightKey, Navigated, PointForPosition, SelectPhase,
     editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
 };
 use gpui::{
@@ -176,6 +176,7 @@ impl Editor {
     pub(crate) fn update_hovered_link(
         &mut self,
         point_for_position: PointForPosition,
+        hint_glyph: Option<DisplayPoint>,
         mouse_position: Option<gpui::Point<Pixels>>,
         snapshot: &EditorSnapshot,
         modifiers: Modifiers,
@@ -194,7 +195,7 @@ impl Editor {
         }
 
         match point_for_position.as_valid() {
-            Some(point) => {
+            Some(point) if hint_glyph.is_none() => {
                 let trigger_point = TriggerPoint::Text(
                     snapshot
                         .buffer_snapshot()
@@ -203,10 +204,10 @@ impl Editor {
 
                 show_link_definition(modifiers.shift, self, trigger_point, snapshot, window, cx);
             }
-            None => {
+            _ => {
                 self.update_inlay_link_and_hover_points(
                     snapshot,
-                    point_for_position,
+                    hint_glyph,
                     mouse_position,
                     hovered_link_modifier,
                     modifiers.shift,
@@ -1186,25 +1187,26 @@ fn surrounding_filename(
 mod tests {
     use super::*;
     use crate::{
-        DisplayPoint,
+        AcceptInlayHint, DisplayPoint, DisplayRow, SelectionEffects, Undo,
         display_map::ToDisplayPoint,
         editor_tests::init_test,
         inlays::inlay_hints::tests::{cached_hint_labels, visible_hint_labels},
         test::editor_lsp_test_context::EditorLspTestContext,
     };
-    use futures::StreamExt;
+    use futures::{StreamExt, channel::oneshot};
     use gpui::{
         Modifiers, MouseButton, MouseDownEvent, MousePressureEvent, MouseUpEvent, PlatformInput,
         PressureStage,
     };
     use indoc::indoc;
-    use language::Point;
+    use language::{FakeLspAdapter, Point, language_settings::InlayHintKind, rust_lang};
     use lsp::request::{GotoDefinition, GotoTypeDefinition};
     use multi_buffer::{MultiBufferOffset, PathKey};
+    use parking_lot::Mutex;
     use settings::InlayHintSettingsContent;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use util::{assert_set_eq, path};
     use workspace::item::Item;
 
@@ -1373,6 +1375,7 @@ mod tests {
             editor.update_hovered_link(
                 point_for_position(link_start),
                 None,
+                None,
                 &old_snapshot,
                 modifiers,
                 window,
@@ -1384,6 +1387,7 @@ mod tests {
         cx.update_editor(|editor, window, cx| {
             editor.update_hovered_link(
                 point_for_position(link_end),
+                None,
                 None,
                 &old_snapshot,
                 modifiers,
@@ -1819,6 +1823,458 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_accept_inlay_hint(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |settings| {
+            settings.defaults.inlay_hints = Some(InlayHintSettingsContent {
+                enabled: Some(true),
+                edit_debounce_ms: Some(0),
+                scroll_debounce_ms: Some(0),
+                ..InlayHintSettingsContent::default()
+            });
+        });
+        let hints = Arc::new(Mutex::new(None::<Vec<lsp::InlayHint>>));
+        let hints_gate = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
+        let resolve_gate = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let fail_next_resolve = Arc::new(AtomicBool::new(false));
+        let mut cx = EditorLspTestContext::new_with_lsp_adapter(
+            Arc::into_inner(rust_lang()).expect("test language"),
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    inlay_hint_provider: Some(lsp::OneOf::Right(
+                        lsp::InlayHintServerCapabilities::Options(lsp::InlayHintOptions {
+                            resolve_provider: Some(true),
+                            ..lsp::InlayHintOptions::default()
+                        }),
+                    )),
+                    ..lsp::ServerCapabilities::default()
+                },
+                initializer: Some(Box::new({
+                    let hints = hints.clone();
+                    let hints_gate = hints_gate.clone();
+                    let resolve_gate = resolve_gate.clone();
+                    let resolve_count = resolve_count.clone();
+                    let fail_next_resolve = fail_next_resolve.clone();
+                    move |server| {
+                        let hints = hints.clone();
+                        let hints_gate = hints_gate.clone();
+                        server.set_request_handler::<lsp::request::InlayHintRequest, _, _>(
+                            move |_, _| {
+                                let hints = hints.lock().take();
+                                let hints_gate = hints_gate.lock().take();
+                                async move {
+                                    if let Some(hints_gate) = hints_gate {
+                                        hints_gate.await?;
+                                    }
+                                    Ok(hints)
+                                }
+                            },
+                        );
+                        let resolve_gate = resolve_gate.clone();
+                        let resolve_count = resolve_count.clone();
+                        let fail_next_resolve = fail_next_resolve.clone();
+                        server.set_request_handler::<lsp::request::InlayHintResolveRequest, _, _>(
+                            move |mut hint, _| {
+                                resolve_count.fetch_add(1, Ordering::Release);
+                                let resolve_gate = resolve_gate.lock().take();
+                                let fail_resolve = fail_next_resolve.swap(false, Ordering::AcqRel);
+                                if hint.data == Some(serde_json::Value::Bool(true))
+                                    && let lsp::InlayHintLabel::String(label) = &hint.label
+                                {
+                                    hint.text_edits = Some(type_hint_edits(hint.position, label));
+                                }
+                                async move {
+                                    if let Some(resolve_gate) = resolve_gate {
+                                        resolve_gate.await?;
+                                    }
+                                    anyhow::ensure!(!fail_resolve, "injected resolve failure");
+                                    Ok(hint)
+                                }
+                            },
+                        );
+                    }
+                })),
+                ..FakeLspAdapter::default()
+            },
+            cx,
+        )
+        .await;
+
+        let source = "fn main() { let valueˇ = 1; }\n";
+        let accepted = "use std::primitive::u32;\nfn main() { let value: u32 = 1; }\n";
+        for edits in [HintEdits::InResponse, HintEdits::OnResolve] {
+            *hints.lock() = Some(vec![type_hint(21, "u32", edits)]);
+            cx.set_state(source);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                assert!(window.is_action_available(&AcceptInlayHint, cx));
+            });
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            assert_eq!(cx.buffer_text(), accepted, "{edits:?}");
+            cx.dispatch_action(Undo);
+            assert_eq!(cx.buffer_text(), "fn main() { let value = 1; }\n");
+        }
+
+        for selection in [
+            "«ˇfn main() { let value» = 1; }\n",
+            "fn main() { let value« = 1; }ˇ»\n",
+        ] {
+            *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::InResponse)]);
+            cx.set_state(selection);
+            cx.run_until_parked();
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            assert_eq!(cx.buffer_text(), accepted, "{selection}");
+        }
+
+        *hints.lock() = Some(vec![
+            type_hint(17, "u32", HintEdits::InResponse),
+            type_hint(28, "u64", HintEdits::OnResolve),
+        ]);
+        cx.set_state("fn main() { «let a = 1; let b = 2;ˇ» }\n");
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "use std::primitive::u32;\nuse std::primitive::u64;\nfn main() { let a: u32 = 1; let b: u64 = 2; }\n"
+        );
+        cx.dispatch_action(Undo);
+        assert_eq!(cx.buffer_text(), "fn main() { let a = 1; let b = 2; }\n");
+
+        *hints.lock() = Some(vec![
+            type_hint(17, "u32", HintEdits::InResponse),
+            type_hint(28, "u32", HintEdits::InResponse),
+        ]);
+        cx.set_state("fn main() { «let a = 1; let b = 2;ˇ» }\n");
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "use std::primitive::u32;\nfn main() { let a: u32 = 1; let b: u32 = 2; }\n"
+        );
+
+        let mut nested_hint = type_hint(21, "Vec<Vec<u32>>", HintEdits::InResponse);
+        nested_hint.text_edits = Some(
+            [": Vec<Vec<u32", ">", ">"]
+                .into_iter()
+                .map(|new_text| lsp::TextEdit {
+                    range: lsp::Range::new(nested_hint.position, nested_hint.position),
+                    new_text: new_text.to_string(),
+                })
+                .collect(),
+        );
+        *hints.lock() = Some(vec![nested_hint]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "fn main() { let value: Vec<Vec<u32>> = 1; }\n"
+        );
+
+        let mut grouped_hints = vec![
+            type_hint(17, "Foo", HintEdits::InResponse),
+            type_hint(28, "Bar", HintEdits::InResponse),
+        ];
+        for hint in &mut grouped_hints {
+            let lsp::InlayHintLabel::String(label) = &hint.label else {
+                unreachable!()
+            };
+            let type_name = label.trim_start_matches(": ").to_string();
+            hint.text_edits = Some(
+                ["use foo::{", type_name.as_str(), "};\n"]
+                    .into_iter()
+                    .map(|new_text| lsp::TextEdit {
+                        range: lsp::Range::default(),
+                        new_text: new_text.to_string(),
+                    })
+                    .collect(),
+            );
+        }
+        *hints.lock() = Some(grouped_hints);
+        cx.set_state("fn main() { «let a = 1; let b = 2;ˇ» }\n");
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "use foo::{Foo};\nuse foo::{Bar};\nfn main() { let a = 1; let b = 2; }\n"
+        );
+
+        let mut conflicting_hints = vec![
+            type_hint(17, "u32", HintEdits::InResponse),
+            type_hint(28, "u64", HintEdits::InResponse),
+        ];
+        for (hint, (start, end)) in conflicting_hints.iter_mut().zip([(0, 5), (3, 9)]) {
+            hint.text_edits = Some(vec![lsp::TextEdit {
+                range: lsp::Range::new(lsp::Position::new(0, start), lsp::Position::new(0, end)),
+                new_text: "conflict".to_string(),
+            }]);
+        }
+        *hints.lock() = Some(conflicting_hints);
+        let conflicting_source = "fn main() { «let a = 1; let b = 2;ˇ» }\n";
+        cx.set_state(conflicting_source);
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        cx.assert_editor_state(conflicting_source);
+
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::InResponse)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        fail_next_resolve.store(true, Ordering::Release);
+        let previous_resolve_count = resolve_count.load(Ordering::Acquire);
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            resolve_count.load(Ordering::Acquire),
+            previous_resolve_count
+        );
+        assert_eq!(cx.buffer_text(), accepted);
+        fail_next_resolve.store(false, Ordering::Release);
+
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::InResponse)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        for (read_only, lsp_enabled) in [(true, true), (false, false)] {
+            cx.update_editor(|editor, _, cx| {
+                editor.set_read_only(read_only);
+                editor.enable_lsp_data = lsp_enabled;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                assert!(!window.is_action_available(&AcceptInlayHint, cx));
+            });
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            cx.assert_editor_state(source);
+        }
+        cx.update_editor(|editor, _, cx| {
+            editor.set_read_only(false);
+            editor.enable_lsp_data = true;
+            cx.notify();
+        });
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::InResponse)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        let hint_start = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 21));
+        let glyph_width = cx
+            .pixel_position_for(DisplayPoint::new(DisplayRow(0), 22))
+            .x
+            - hint_start.x;
+        let line_height = cx.update_editor(|editor, window, cx| {
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+        let below_end_of_file = gpui::point(hint_start.x, hint_start.y + line_height * 3.);
+        cx.simulate_mouse_move(below_end_of_file, None, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_click(below_end_of_file, Modifiers::none());
+        simulate_double_click(&mut cx, below_end_of_file);
+        cx.run_until_parked();
+        assert_eq!(cx.buffer_text(), "fn main() { let value = 1; }\n");
+        for (x_offset, expected_text) in [
+            (-glyph_width / 4., "fn main() { let «valueˇ» = 1; }\n"),
+            (
+                glyph_width / 4.,
+                "use std::primitive::u32;\nfn main() { let value: u32ˇ = 1; }\n",
+            ),
+            (
+                glyph_width * 2.5,
+                "use std::primitive::u32;\nfn main() { let value: u32ˇ = 1; }\n",
+            ),
+        ] {
+            *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::InResponse)]);
+            cx.set_state(source);
+            cx.run_until_parked();
+            let point = gpui::point(hint_start.x + x_offset, hint_start.y);
+            cx.simulate_click(point, Modifiers::none());
+            simulate_double_click(&mut cx, point);
+            cx.run_until_parked();
+            cx.assert_editor_state(expected_text);
+        }
+
+        for read_only_while_resolving in [true, false] {
+            *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::OnResolve)]);
+            cx.set_state(source);
+            cx.run_until_parked();
+            let (release_resolve, gate) = oneshot::channel();
+            *resolve_gate.lock() = Some(gate);
+            let previous_resolve_count = resolve_count.load(Ordering::Acquire);
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            assert_eq!(
+                resolve_count.load(Ordering::Acquire),
+                previous_resolve_count + 1
+            );
+            cx.assert_editor_state(source);
+            cx.update_editor(|editor, _, _| editor.set_read_only(read_only_while_resolving));
+            release_resolve.send(()).expect("pending resolve gate");
+            cx.run_until_parked();
+            if read_only_while_resolving {
+                cx.assert_editor_state(source);
+                cx.update_editor(|editor, _, _| editor.set_read_only(false));
+                cx.run_until_parked();
+                cx.dispatch_action(AcceptInlayHint);
+                cx.run_until_parked();
+                assert_eq!(cx.buffer_text(), accepted, "accept after read-only");
+            } else {
+                assert_eq!(cx.buffer_text(), accepted);
+            }
+        }
+
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::OnResolve)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        fail_next_resolve.store(true, Ordering::Release);
+        let previous_resolve_count = resolve_count.load(Ordering::Acquire);
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            resolve_count.load(Ordering::Acquire),
+            previous_resolve_count + 1
+        );
+        cx.assert_editor_state(source);
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            resolve_count.load(Ordering::Acquire),
+            previous_resolve_count + 2
+        );
+        assert_eq!(cx.buffer_text(), accepted);
+
+        let two_hints_source = "fn main() { «let a = 1; let b = 2;ˇ» }\n";
+        *hints.lock() = Some(vec![
+            type_hint(17, "u32", HintEdits::InResponse),
+            type_hint(28, "u64", HintEdits::OnResolve),
+        ]);
+        cx.set_state(two_hints_source);
+        cx.run_until_parked();
+        let (release_resolve, gate) = oneshot::channel();
+        *resolve_gate.lock() = Some(gate);
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        cx.assert_editor_state(two_hints_source);
+        let (release_hints, gate) = oneshot::channel();
+        *hints_gate.lock() = Some(gate);
+        cx.lsp
+            .request::<lsp::request::InlayHintRefreshRequest>((), lsp::DEFAULT_LSP_REQUEST_TIMEOUT)
+            .await
+            .into_response()
+            .expect("inlay hint refresh request");
+        cx.run_until_parked();
+        release_resolve.send(()).expect("pending resolve gate");
+        cx.run_until_parked();
+        cx.assert_editor_state(two_hints_source);
+        release_hints.send(()).expect("pending hints gate");
+        cx.run_until_parked();
+        cx.assert_editor_state(two_hints_source);
+
+        for (second_hint_edits, expected_text) in [
+            (
+                HintEdits::None,
+                "use std::primitive::u32;\nfn main() { let a: u32 = 1; let b = 2; }\n",
+            ),
+            (
+                HintEdits::InResponse,
+                "use std::primitive::u32;\nuse std::primitive::u64;\nfn main() { let a: u32 = 1; let b: u64 = 2; }\n",
+            ),
+        ] {
+            *hints.lock() = Some(vec![
+                type_hint(17, "u32", HintEdits::OnResolve),
+                type_hint(28, "u64", second_hint_edits),
+            ]);
+            cx.set_state("fn main() { let aˇ = 1; let b = 2; }\n");
+            cx.run_until_parked();
+            let (release_resolve, gate) = oneshot::channel();
+            *resolve_gate.lock() = Some(gate);
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            cx.update_editor(|editor, window, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(0, 28)..Point::new(0, 28)]);
+                });
+            });
+            cx.run_until_parked();
+            cx.dispatch_action(AcceptInlayHint);
+            cx.run_until_parked();
+            cx.assert_editor_state("fn main() { let a = 1; let bˇ = 2; }\n");
+            release_resolve.send(()).expect("pending resolve gate");
+            cx.run_until_parked();
+            assert_eq!(cx.buffer_text(), expected_text, "{second_hint_edits:?}");
+            cx.dispatch_action(Undo);
+            assert_eq!(cx.buffer_text(), "fn main() { let a = 1; let b = 2; }\n");
+        }
+
+        *hints.lock() = Some(vec![type_hint(17, "u32", HintEdits::OnResolve)]);
+        cx.set_state("fn main() { let aˇ = 1; let b = 2; }\n");
+        cx.run_until_parked();
+        let (release_resolve, gate) = oneshot::channel();
+        *resolve_gate.lock() = Some(gate);
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        *hints.lock() = Some(vec![type_hint(32, "u64", HintEdits::InResponse)]);
+        cx.update_buffer(|buffer, cx| buffer.edit([(0..0, "pub ")], None, cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 32)..Point::new(0, 32)]);
+            });
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "use std::primitive::u64;\npub fn main() { let a = 1; let b: u64 = 2; }\n"
+        );
+        drop(release_resolve);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.buffer_text(),
+            "use std::primitive::u64;\npub fn main() { let a = 1; let b: u64 = 2; }\n"
+        );
+
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::None)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        cx.dispatch_action(AcceptInlayHint);
+        cx.run_until_parked();
+        cx.assert_editor_state(source);
+        let point = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 23));
+        cx.simulate_click(point, Modifiers::none());
+        simulate_double_click(&mut cx, point);
+        cx.run_until_parked();
+        cx.assert_editor_state("fn main() { let «valueˇ» = 1; }\n");
+
+        *hints.lock() = Some(vec![type_hint(21, "u32", HintEdits::OnResolve)]);
+        cx.set_state(source);
+        cx.run_until_parked();
+        let (release_resolve, gate) = oneshot::channel();
+        *resolve_gate.lock() = Some(gate);
+        cx.simulate_mouse_move(point, None, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_click(point, Modifiers::none());
+        simulate_double_click(&mut cx, point);
+        cx.run_until_parked();
+        cx.assert_editor_state("fn main() { let «valueˇ» = 1; }\n");
+        release_resolve.send(()).expect("pending resolve gate");
+        cx.run_until_parked();
+        cx.assert_editor_state("fn main() { let «valueˇ» = 1; }\n");
+        cx.simulate_click(point, Modifiers::none());
+        simulate_double_click(&mut cx, point);
+        cx.run_until_parked();
+        assert_eq!(cx.buffer_text(), accepted);
+    }
+
+    #[gpui::test]
     async fn test_inlay_hover_links(cx: &mut gpui::TestAppContext) {
         init_test(cx, |settings| {
             settings.defaults.inlay_hints = Some(InlayHintSettingsContent {
@@ -1894,7 +2350,10 @@ mod tests {
                             ..lsp::InlayHintLabelPart::default()
                         }]),
                         kind: Some(lsp::InlayHintKind::TYPE),
-                        text_edits: None,
+                        text_edits: Some(vec![lsp::TextEdit {
+                            range: lsp::Range::new(hint_position, hint_position),
+                            new_text: ": TestStruct".to_string(),
+                        }]),
                         tooltip: None,
                         padding_left: Some(false),
                         padding_right: Some(false),
@@ -1982,11 +2441,18 @@ mod tests {
                 .cloned()
                 .expect("hovered inlay");
             let hovered_inlay_id = hovered_inlay.id;
-            editor.splice_inlays(&[hovered_inlay_id], vec![hovered_inlay], cx);
+            editor.splice_inlays(&[hovered_inlay_id], Vec::new(), cx);
             assert!(
                 editor.hovered_inlay_hint_command().is_none(),
-                "replacing the hovered inlay should clear its command"
+                "removing the hovered inlay should clear its command"
             );
+            editor.splice_inlays(&[], vec![hovered_inlay], cx);
+            editor
+                .inlay_hints
+                .as_mut()
+                .expect("inlay hints enabled")
+                .added_hints
+                .insert(hovered_inlay_id, Some(InlayHintKind::Type));
         });
         cx.simulate_click(hover_point, Modifiers::none());
         cx.background_executor.run_until_parked();
@@ -2011,24 +2477,19 @@ mod tests {
                 }
             "});
 
-        cx.simulate_event(MouseDownEvent {
-            position: hover_point,
-            modifiers: Modifiers::none(),
-            button: MouseButton::Left,
-            click_count: 2,
-            first_mouse: false,
-        });
-        cx.simulate_event(MouseUpEvent {
-            position: hover_point,
-            modifiers: Modifiers::none(),
-            button: MouseButton::Left,
-            click_count: 2,
-        });
+        simulate_double_click(&mut cx, hover_point);
         cx.background_executor.run_until_parked();
         assert!(
             command_requests.try_recv().is_err(),
             "Second click of a double click should not re-run the inlay hint command"
         );
+        cx.assert_editor_state(indoc! {"
+                struct TestStruct;
+
+                fn main() {
+                    let variableˇ = TestStruct;
+                }
+            "});
 
         cx.simulate_modifiers_change(Modifiers::secondary_key());
         cx.background_executor.run_until_parked();
@@ -3657,6 +4118,58 @@ Sentence ending file2.rs.
                 editor.hover_state.info_popovers.is_empty(),
                 "no popovers should appear when hover_popover_enabled is false"
             );
+        });
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum HintEdits {
+        InResponse,
+        OnResolve,
+        None,
+    }
+
+    fn type_hint(column: u32, type_name: &str, edits: HintEdits) -> lsp::InlayHint {
+        let position = lsp::Position::new(0, column);
+        let label = format!(": {type_name}");
+        lsp::InlayHint {
+            position,
+            text_edits: (edits == HintEdits::InResponse).then(|| type_hint_edits(position, &label)),
+            label: lsp::InlayHintLabel::String(label),
+            kind: Some(lsp::InlayHintKind::TYPE),
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: (edits == HintEdits::OnResolve).then_some(serde_json::Value::Bool(true)),
+        }
+    }
+
+    fn type_hint_edits(position: lsp::Position, label: &str) -> Vec<lsp::TextEdit> {
+        let type_name = label.trim_start_matches(": ");
+        vec![
+            lsp::TextEdit {
+                range: lsp::Range::new(position, position),
+                new_text: label.to_string(),
+            },
+            lsp::TextEdit {
+                range: lsp::Range::default(),
+                new_text: format!("use std::primitive::{type_name};\n"),
+            },
+        ]
+    }
+
+    fn simulate_double_click(cx: &mut EditorLspTestContext, position: gpui::Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
         });
     }
 }

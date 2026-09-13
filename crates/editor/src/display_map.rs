@@ -128,6 +128,7 @@ use std::{
     iter,
     num::NonZeroU32,
     ops::{self, Add, Range, RangeInclusive, Sub},
+    slice,
     sync::Arc,
 };
 
@@ -1280,7 +1281,7 @@ impl DisplayMap {
         widths_changed
     }
 
-    pub(crate) fn current_inlays(&self) -> impl Iterator<Item = &Inlay> + Default {
+    pub(crate) fn current_inlays(&self) -> slice::Iter<'_, Inlay> {
         self.inlay_map.current_inlays()
     }
 
@@ -1740,6 +1741,33 @@ impl DisplaySnapshot {
     pub fn display_point_to_inlay_offset(&self, point: DisplayPoint, bias: Bias) -> InlayOffset {
         self.inlay_snapshot()
             .to_offset(self.display_point_to_inlay_point(point, bias))
+    }
+
+    pub fn inlay_hint_at(&self, point: DisplayPoint) -> Option<(&Inlay, usize)> {
+        if point.row() > self.max_point().row()
+            || self.is_block_line(point.row())
+            || point.column() >= self.line_len(point.row())
+        {
+            return None;
+        }
+        let wrap_row = self
+            .block_snapshot
+            .to_wrap_point(BlockPoint::new(BlockRow(point.row().0), 0), Bias::Left)
+            .row();
+        let wrap_indent = wrap_row
+            .0
+            .checked_sub(1)
+            .and_then(|previous_row| self.wrap_snapshot().soft_wrap_indent(WrapRow(previous_row)));
+        if wrap_indent.is_some_and(|indent| point.column() < indent) {
+            return None;
+        }
+        let fold_point = self.display_point_to_fold_point(point, Bias::Left);
+        if self.fold_snapshot().is_fold_placeholder(fold_point) {
+            return None;
+        }
+        let inlay_point = fold_point.to_inlay_point(self.fold_snapshot());
+        self.inlay_snapshot()
+            .inlay_hint_at_offset(self.inlay_snapshot().to_offset(inlay_point))
     }
 
     pub fn anchor_to_inlay_offset(&self, anchor: Anchor) -> InlayOffset {
@@ -3193,6 +3221,233 @@ pub mod tests {
                 .next(),
             Some("c   ccccc")
         );
+    }
+
+    #[gpui::test]
+    fn test_inlay_hint_at(cx: &mut App) {
+        init_test(cx, &|_| {});
+        let buffer = MultiBuffer::build_simple("ab\ncd", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let position = buffer_snapshot.anchor_after(MultiBufferOffset(1));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                test_font(),
+                px(14.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = map.update(cx, |map, cx| {
+            map.splice_inlays(
+                &[],
+                vec![
+                    Inlay::mock_hint(0, position, " é界🙂 "),
+                    Inlay::mock_hint(1, position, "λ"),
+                    Inlay::edit_prediction(0, position, "P"),
+                    Inlay::mock_hint(2, buffer_snapshot.anchor_after(buffer_snapshot.len()), "z"),
+                ],
+                cx,
+            );
+            map.snapshot(cx)
+        });
+        assert_eq!(snapshot.text(), "a é界🙂 λPb\ncdz");
+        for (row, column, expected) in [
+            (0, 0, None),
+            (0, 1, Some((InlayId::Hint(0), 0))),
+            (0, 2, Some((InlayId::Hint(0), 1))),
+            (0, 4, Some((InlayId::Hint(0), 3))),
+            (0, 7, Some((InlayId::Hint(0), 6))),
+            (0, 11, Some((InlayId::Hint(0), 10))),
+            (0, 12, Some((InlayId::Hint(1), 0))),
+            (0, 14, None),
+            (0, 15, None),
+            (0, 16, None),
+            (1, 0, None),
+            (1, 1, None),
+            (1, 2, Some((InlayId::Hint(2), 0))),
+            (1, 3, None),
+        ] {
+            let point = DisplayPoint::new(DisplayRow(row), column);
+            assert_eq!(
+                snapshot
+                    .inlay_hint_at(point)
+                    .map(|(hint, offset)| (hint.id, offset)),
+                expected,
+                "point {point:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_inlay_hint_at_soft_wrap_indent(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let buffer = cx.new(|cx| Buffer::local("  ab", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let position = buffer_snapshot.anchor_after(MultiBufferOffset(3));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Courier"),
+                px(16.0),
+                Some(px(40.0)),
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = map.update(cx, |map, cx| {
+            map.splice_inlays(&[], vec![Inlay::mock_hint(0, position, "wxyz")], cx);
+            map.snapshot(cx)
+        });
+        assert_eq!(snapshot.text(), "  aw\n  xy\n  zb");
+        for (row, column, expected) in [
+            (0, 2, None),
+            (0, 3, Some(0)),
+            (0, 4, None),
+            (1, 0, None),
+            (1, 1, None),
+            (1, 2, Some(1)),
+            (1, 3, Some(2)),
+            (1, 4, None),
+            (2, 0, None),
+            (2, 1, None),
+            (2, 2, Some(3)),
+            (2, 3, None),
+            (2, 4, None),
+        ] {
+            let point = DisplayPoint::new(DisplayRow(row), column);
+            assert_eq!(
+                snapshot.inlay_hint_at(point).map(|(_, offset)| offset),
+                expected,
+                "point {point:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_inlay_hint_at_fold_placeholder(cx: &mut App) {
+        init_test(cx, &|_| {});
+        let buffer = MultiBuffer::build_simple("ab\ncd\nef", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                test_font(),
+                px(14.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = map.update(cx, |map, cx| {
+            map.splice_inlays(
+                &[],
+                vec![
+                    Inlay::mock_hint(0, buffer_snapshot.anchor_after(MultiBufferOffset(1)), "X"),
+                    Inlay::mock_hint(1, buffer_snapshot.anchor_after(MultiBufferOffset(8)), "Y"),
+                ],
+                cx,
+            );
+            map.fold(
+                vec![Crease::simple(
+                    MultiBufferPoint::new(0, 1)..MultiBufferPoint::new(2, 1),
+                    FoldPlaceholder::test(),
+                )],
+                cx,
+            );
+            map.snapshot(cx)
+        });
+        assert_eq!(snapshot.text(), "a⋯fY");
+        for (column, expected) in [
+            (0, None),
+            (1, None),
+            (2, None),
+            (3, None),
+            (4, None),
+            (5, Some((InlayId::Hint(1), 0))),
+            (6, None),
+        ] {
+            let point = DisplayPoint::new(DisplayRow(0), column);
+            assert_eq!(
+                snapshot
+                    .inlay_hint_at(point)
+                    .map(|(hint, offset)| (hint.id, offset)),
+                expected,
+                "point {point:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_inlay_hint_at_after_replace_block(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let buffer = cx.new(|cx| Buffer::local("  abcd\nz", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Courier"),
+                px(16.0),
+                Some(px(40.0)),
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = map.update(cx, |map, cx| {
+            map.splice_inlays(
+                &[],
+                vec![Inlay::mock_hint(
+                    0,
+                    buffer_snapshot.anchor_before(Point::new(1, 0)),
+                    "XY",
+                )],
+                cx,
+            );
+            map.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Replace(
+                        buffer_snapshot.anchor_before(Point::new(0, 0))
+                            ..=buffer_snapshot.anchor_after(Point::new(0, 6)),
+                    ),
+                    height: Some(1),
+                    style: BlockStyle::Fixed,
+                    render: Arc::new(|_| div().into_any()),
+                    priority: 0,
+                }],
+                cx,
+            );
+            map.snapshot(cx)
+        });
+        assert_eq!(snapshot.text(), "\nXYz");
+        for (row, column, expected) in [
+            (0, 0, None),
+            (1, 0, Some(0)),
+            (1, 1, Some(1)),
+            (1, 2, None),
+            (1, 3, None),
+        ] {
+            let point = DisplayPoint::new(DisplayRow(row), column);
+            assert_eq!(
+                snapshot.inlay_hint_at(point).map(|(_, offset)| offset),
+                expected,
+                "point {point:?}"
+            );
+        }
     }
 
     #[gpui::test]

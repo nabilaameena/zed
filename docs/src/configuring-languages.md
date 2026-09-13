@@ -488,6 +488,9 @@ Inlay hints provide additional information inline in your code, such as paramete
 }
 ```
 
+Hover a hint to see its tooltip, and double-click it to insert it into the code, if the language server provides the edits for that (for example, rust-analyzer's type hints).
+{#action editor::AcceptInlayHint} does the same for every hint the selection touches.
+
 For language-specific inlay hint settings, refer to the documentation for each language.
 
 ### Code Actions

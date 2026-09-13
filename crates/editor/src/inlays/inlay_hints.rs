@@ -6,7 +6,10 @@ use std::{
 
 use clock::Global;
 use collections::{HashMap, HashSet};
-use futures::future::join_all;
+use futures::{
+    channel::oneshot,
+    future::{self, Shared, join_all},
+};
 use gpui::{App, Entity, Pixels, Task, TaskExt};
 use itertools::Itertools;
 use language::{
@@ -14,20 +17,20 @@ use language::{
     language_settings::{InlayHintKind, InlayHintSettings},
 };
 use lsp::LanguageServerId;
-use multi_buffer::{Anchor, MultiBufferSnapshot};
+use multi_buffer::{Anchor, MultiBufferSnapshot, ToOffset as _};
 use project::{
-    CodeAction, HoverBlock, HoverBlockKind, InlayHintLabel, InlayHintLabelPartTooltip,
-    InlayHintTooltip, InvalidationStrategy, LspAction, ResolveState,
-    lsp_store::{CacheInlayHints, ResolvedHint},
+    CodeAction, HoverBlock, HoverBlockKind, InlayHint, InlayHintLabel, InlayHintLabelPartTooltip,
+    InlayHintTooltip, InvalidationStrategy, LspAction,
+    lsp_store::{CacheInlayHints, LspStore, ResolvedHint},
 };
-use text::{Bias, BufferId};
+use text::{BufferId, ToOffset as _};
 use ui::{Context, Window};
-use util::debug_panic;
 
 use super::{Inlay, InlayId};
 use crate::{
-    Editor, EditorSnapshot, PointForPosition, ToggleInlayHints, ToggleInlineValues, debounce_value,
-    display_map::{DisplayMap, InlayOffset},
+    AcceptInlayHint, DisplayPoint, Editor, EditorSnapshot, ToggleInlayHints, ToggleInlineValues,
+    debounce_value,
+    display_map::DisplayMap,
     hover_links::{InlayHighlight, TriggerPoint, show_link_definition},
     hover_popover::{self, InlayHover},
     inlays::InlaySplice,
@@ -41,23 +44,20 @@ pub(crate) struct HoveredInlayHintCommand {
 }
 
 impl HoveredInlayHintCommand {
-    pub(crate) fn contains_point(
+    pub(crate) fn contains_glyph(
         &self,
         snapshot: &EditorSnapshot,
-        point_for_position: PointForPosition,
+        hint_glyph: Option<DisplayPoint>,
     ) -> bool {
-        if point_for_position.column_overshoot_after_line_end != 0
-            || point_for_position.as_valid().is_some()
-            || !snapshot.can_resolve(&self.highlight.inlay_position)
-        {
+        if !snapshot.can_resolve(&self.highlight.inlay_position) {
             return false;
         }
-        let hovered_offset =
-            snapshot.display_point_to_inlay_offset(point_for_position.exact_unclipped, Bias::Left);
-        let hint_start = snapshot.anchor_to_inlay_offset(self.highlight.inlay_position);
-        let part_range = InlayOffset(hint_start.0 + self.highlight.range.start)
-            ..InlayOffset(hint_start.0 + self.highlight.range.end);
-        part_range.contains(&hovered_offset)
+        let Some((hint, offset_in_hint)) =
+            hint_glyph.and_then(|glyph| snapshot.inlay_hint_at(glyph))
+        else {
+            return false;
+        };
+        hint.id == self.highlight.inlay && self.highlight.range.contains(&offset_in_hint)
     }
 }
 
@@ -82,6 +82,35 @@ pub struct LspInlayHintData {
     invalidate_hints_for_buffers: HashSet<BufferId>,
     pub added_hints: HashMap<InlayId, Option<InlayHintKind>>,
     hovered_command: Option<HoveredInlayHintCommand>,
+    hints_at_selections: Vec<(BufferId, InlayId)>,
+    pending_text_edits: Option<PendingHintTextEdits>,
+}
+
+#[derive(Debug)]
+struct PendingHintTextEdits {
+    hints: Vec<PendingHint>,
+    wake: Option<oneshot::Sender<()>>,
+    _apply_task: Task<()>,
+}
+
+#[derive(Debug)]
+struct PendingHint {
+    buffer_id: BufferId,
+    hint_id: InlayId,
+    resolve: Option<Shared<Task<Option<InlayHint>>>>,
+}
+
+impl PendingHintTextEdits {
+    fn remove_hints_for_buffers(&mut self, buffer_ids: &HashSet<BufferId>) {
+        let hints_before = self.hints.len();
+        self.hints
+            .retain(|hint| !buffer_ids.contains(&hint.buffer_id));
+        if self.hints.len() != hints_before
+            && let Some(wake) = self.wake.take()
+        {
+            wake.send(()).ok();
+        }
+    }
 }
 
 impl LspInlayHintData {
@@ -98,6 +127,8 @@ impl LspInlayHintData {
             append_debounce: debounce_value(settings.scroll_debounce_ms),
             allowed_hint_kinds: settings.enabled_inlay_hint_kinds(),
             hovered_command: None,
+            hints_at_selections: Vec::new(),
+            pending_text_edits: None,
         }
     }
 
@@ -131,6 +162,8 @@ impl LspInlayHintData {
         self.hint_chunk_fetching.clear();
         self.added_hints.clear();
         self.hovered_command = None;
+        self.hints_at_selections.clear();
+        self.pending_text_edits = None;
     }
 
     /// Like `clear`, but only wipes tracking state for the given buffer IDs.
@@ -148,6 +181,12 @@ impl LspInlayHintData {
             .is_some_and(|command| buffer_ids.contains(&command.buffer_id))
         {
             self.hovered_command = None;
+        }
+        if let Some(pending_text_edits) = &mut self.pending_text_edits {
+            pending_text_edits.remove_hints_for_buffers(buffer_ids);
+            if pending_text_edits.hints.is_empty() {
+                self.pending_text_edits = None;
+            }
         }
         for buffer_id in buffer_ids {
             self.hint_refresh_tasks.remove(buffer_id);
@@ -332,6 +371,296 @@ impl Editor {
             InlayHintRefreshReason::Toggle(!self.inlay_hints_enabled()),
             cx,
         );
+    }
+
+    pub fn accept_inlay_hint(
+        &mut self,
+        _: &AcceptInlayHint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inlay_hints) = &self.inlay_hints else {
+            return;
+        };
+        let hints = inlay_hints.hints_at_selections.clone();
+        self.apply_inlay_hint_text_edits(hints, true, window, cx);
+    }
+
+    pub(crate) fn can_accept_inlay_hint(&self, cx: &App) -> bool {
+        self.lsp_data_enabled()
+            && !self.read_only(cx)
+            && self
+                .inlay_hints
+                .as_ref()
+                .is_some_and(|inlay_hints| !inlay_hints.hints_at_selections.is_empty())
+    }
+
+    pub(crate) fn apply_inlay_hint_text_edits(
+        &mut self,
+        hints: impl IntoIterator<Item = (BufferId, InlayId)>,
+        resolve_missing_edits: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.lsp_data_enabled() || self.read_only(cx) || self.inlay_hints.is_none() {
+            return false;
+        }
+        let Some(lsp_store) = self.project().map(|project| project.read(cx).lsp_store()) else {
+            return false;
+        };
+        let mut new_hints = Vec::new();
+        for (buffer_id, hint_id) in hints {
+            if self
+                .buffer
+                .read(cx)
+                .buffer(buffer_id)
+                .is_none_or(|buffer| buffer.read(cx).read_only())
+            {
+                continue;
+            }
+            let Some(has_text_edits) = lsp_store
+                .read(cx)
+                .cached_inlay_hint(buffer_id, hint_id)
+                .map(InlayHint::has_text_edits)
+            else {
+                continue;
+            };
+            let resolve = if has_text_edits {
+                None
+            } else if !resolve_missing_edits {
+                continue;
+            } else {
+                match lsp_store.update(cx, |lsp_store, cx| {
+                    lsp_store.resolved_hint(buffer_id, hint_id, cx)
+                }) {
+                    Some(ResolvedHint::Resolving(resolve)) => Some(resolve),
+                    Some(ResolvedHint::Resolved(_)) | None => continue,
+                }
+            };
+            let already_pending = self
+                .inlay_hints
+                .as_ref()
+                .and_then(|inlay_hints| inlay_hints.pending_text_edits.as_ref())
+                .is_some_and(|pending| pending.hints.iter().any(|hint| hint.hint_id == hint_id));
+            if !already_pending {
+                new_hints.push(PendingHint {
+                    buffer_id,
+                    hint_id,
+                    resolve,
+                });
+            }
+        }
+        if new_hints.is_empty() {
+            return false;
+        }
+        let Some(inlay_hints) = self.inlay_hints.as_mut() else {
+            return false;
+        };
+        match &mut inlay_hints.pending_text_edits {
+            Some(pending) => {
+                pending.hints.extend(new_hints);
+                if let Some(wake) = pending.wake.take() {
+                    wake.send(()).ok();
+                }
+            }
+            None => {
+                inlay_hints.pending_text_edits = Some(PendingHintTextEdits {
+                    hints: new_hints,
+                    wake: None,
+                    _apply_task: cx.spawn_in(window, async move |editor, cx| {
+                        loop {
+                            let Ok(Some((resolves, wake))) = editor.update(cx, |editor, _| {
+                                let pending =
+                                    editor.inlay_hints.as_mut()?.pending_text_edits.as_mut()?;
+                                let resolves = pending
+                                    .hints
+                                    .iter()
+                                    .filter_map(|hint| hint.resolve.clone())
+                                    .collect::<Vec<_>>();
+                                let (wake_sender, wake) = oneshot::channel();
+                                pending.wake = Some(wake_sender);
+                                Some((resolves, wake))
+                            }) else {
+                                return;
+                            };
+                            if resolves.is_empty() {
+                                break;
+                            }
+                            future::select(join_all(resolves), wake).await;
+                            editor
+                                .update(cx, |editor, _| {
+                                    if let Some(pending) =
+                                        editor.inlay_hints.as_mut().and_then(|inlay_hints| {
+                                            inlay_hints.pending_text_edits.as_mut()
+                                        })
+                                    {
+                                        for hint in &mut pending.hints {
+                                            if hint
+                                                .resolve
+                                                .as_ref()
+                                                .is_some_and(|resolve| resolve.peek().is_some())
+                                            {
+                                                hint.resolve = None;
+                                            }
+                                        }
+                                    }
+                                })
+                                .ok();
+                        }
+                        editor
+                            .update_in(cx, |editor, window, cx| {
+                                editor.apply_pending_inlay_hint_text_edits(&lsp_store, window, cx)
+                            })
+                            .ok();
+                    }),
+                });
+            }
+        }
+        true
+    }
+
+    fn apply_pending_inlay_hint_text_edits(
+        &mut self,
+        lsp_store: &Entity<LspStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self
+            .inlay_hints
+            .as_mut()
+            .and_then(|inlay_hints| inlay_hints.pending_text_edits.take())
+        else {
+            return;
+        };
+        if !self.lsp_data_enabled() || self.read_only(cx) {
+            return;
+        }
+        let Some(inlay_hints) = &self.inlay_hints else {
+            return;
+        };
+        let mut hint_ids = Vec::new();
+        let mut edits_by_buffer = HashMap::default();
+        for PendingHint {
+            buffer_id, hint_id, ..
+        } in pending.hints
+        {
+            let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx);
+            let Some(text_edits) = lsp_store
+                .read(cx)
+                .cached_inlay_hint(buffer_id, hint_id)
+                .and_then(|hint| hint.text_edits.clone())
+            else {
+                continue;
+            };
+            if text_edits.edits.is_empty()
+                || buffer_snapshot.read_only()
+                || !buffer_snapshot
+                    .version()
+                    .observed_all(&text_edits.buffer_version)
+                || !inlay_hints.added_hints.contains_key(&hint_id)
+            {
+                continue;
+            }
+            hint_ids.push(hint_id);
+            let (_, buffer_edits) = edits_by_buffer
+                .entry(buffer_id)
+                .or_insert_with(|| (buffer.clone(), Vec::<HintTextEdit>::new()));
+            let mut hint_edits = Vec::<HintTextEdit>::new();
+            for (range, new_text) in text_edits.edits {
+                let offsets =
+                    range.start.to_offset(buffer_snapshot)..range.end.to_offset(buffer_snapshot);
+                match hint_edits.last_mut() {
+                    Some(previous_edit) if previous_edit.offsets == offsets => {
+                        previous_edit.new_text.push_str(&new_text);
+                    }
+                    _ => hint_edits.push(HintTextEdit {
+                        offsets,
+                        range,
+                        new_text,
+                    }),
+                }
+            }
+            for hint_edit in hint_edits {
+                let already_applied = buffer_edits.iter().any(|edit| {
+                    edit.offsets == hint_edit.offsets && edit.new_text == hint_edit.new_text
+                });
+                if !already_applied {
+                    buffer_edits.push(hint_edit);
+                }
+            }
+        }
+        if hint_ids.is_empty() {
+            return;
+        }
+        for (_, buffer_edits) in edits_by_buffer.values_mut() {
+            buffer_edits.sort_by_key(|edit| (edit.offsets.start, edit.offsets.end));
+            if buffer_edits
+                .windows(2)
+                .any(|edits| edits[0].offsets.end > edits[1].offsets.start)
+            {
+                log::warn!("Inlay hints {hint_ids:?} have conflicting text edits");
+                return;
+            }
+        }
+        self.finalize_last_transaction(cx);
+        self.transact(window, cx, |_, _, cx| {
+            for (buffer, buffer_edits) in edits_by_buffer.into_values() {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.edit(
+                        buffer_edits
+                            .into_iter()
+                            .map(|edit| (edit.range, edit.new_text)),
+                        None,
+                        cx,
+                    )
+                });
+            }
+        });
+        self.finalize_last_transaction(cx);
+        self.splice_inlays(&hint_ids, Vec::new(), cx);
+    }
+
+    pub(crate) fn refresh_inlay_hints_at_selections(
+        &mut self,
+        buffer_snapshot: &MultiBufferSnapshot,
+        cx: &App,
+    ) {
+        let Some(inlay_hints) = &mut self.inlay_hints else {
+            return;
+        };
+        inlay_hints.hints_at_selections.clear();
+        let inlays = self.display_map.read(cx).current_inlays().as_slice();
+        let multi_buffer = self.buffer.read(cx);
+        for selection in self.selections.disjoint_anchors() {
+            let start = selection.start.to_offset(buffer_snapshot);
+            let end = selection.end.to_offset(buffer_snapshot);
+            let first_inlay =
+                inlays.partition_point(|inlay| inlay.position.to_offset(buffer_snapshot) < start);
+            for inlay in &inlays[first_inlay..] {
+                if inlay.position.to_offset(buffer_snapshot) > end {
+                    break;
+                }
+                if !matches!(inlay.id, InlayId::Hint(_)) {
+                    continue;
+                }
+                let Some(buffer_id) = inlay
+                    .position
+                    .raw_text_anchor()
+                    .map(|anchor| anchor.buffer_id)
+                else {
+                    continue;
+                };
+                if multi_buffer
+                    .buffer(buffer_id)
+                    .is_some_and(|buffer| !buffer.read(cx).read_only())
+                {
+                    inlay_hints.hints_at_selections.push((buffer_id, inlay.id));
+                }
+            }
+        }
     }
 
     pub fn inlay_hints_enabled(&self) -> bool {
@@ -628,207 +957,213 @@ impl Editor {
     pub fn update_inlay_link_and_hover_points(
         &mut self,
         snapshot: &EditorSnapshot,
-        point_for_position: PointForPosition,
+        hint_glyph: Option<DisplayPoint>,
         mouse_position: Option<gpui::Point<Pixels>>,
         secondary_held: bool,
         shift_held: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(lsp_store) = self.project().map(|project| project.read(cx).lsp_store()) else {
+        self.hover_state.hovered_hint_resolve_task = None;
+        let hovered_hint = hint_glyph.and_then(|glyph| snapshot.inlay_hint_at(glyph));
+        let resolved_hint = hovered_hint.and_then(|(hint, _)| {
+            if !self.lsp_data_enabled() {
+                return None;
+            }
+            let buffer_id = hint.position.raw_text_anchor()?.buffer_id;
+            let lsp_store = self.project()?.read(cx).lsp_store();
+            let resolved = lsp_store.update(cx, |lsp_store, cx| {
+                lsp_store.resolved_hint(buffer_id, hint.id, cx)
+            })?;
+            Some((hint.id, buffer_id, resolved))
+        });
+        let Some((hint_id, buffer_id, resolved_hint)) = resolved_hint else {
+            self.hide_hovered_link(cx);
+            hover_popover::hover_at(self, None, mouse_position, window, cx);
+            if let Some(inlay_hints) = self.inlay_hints.as_mut() {
+                inlay_hints.hovered_command = None;
+            }
             return;
         };
-        let hovered_offset = if point_for_position.column_overshoot_after_line_end == 0 {
-            Some(
-                snapshot
-                    .display_point_to_inlay_offset(point_for_position.exact_unclipped, Bias::Left),
-            )
-        } else {
-            None
-        };
-        let mut go_to_definition_updated = false;
-        let mut hover_updated = false;
-        let mut inlay_command_updated = false;
-        if let Some(hovered_offset) = hovered_offset {
-            let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
-            let previous_valid_anchor = buffer_snapshot.anchor_at(
-                point_for_position.previous_valid.to_point(snapshot),
-                Bias::Left,
-            );
-            let next_valid_anchor = buffer_snapshot.anchor_at(
-                point_for_position.next_valid.to_point(snapshot),
-                Bias::Right,
-            );
-            if let Some(hovered_hint) = Self::visible_inlay_hints(self.display_map.read(cx))
-                .filter(|hint| snapshot.can_resolve(&hint.position))
-                .skip_while(|hint| {
-                    hint.position
-                        .cmp(&previous_valid_anchor, &buffer_snapshot)
-                        .is_lt()
-                })
-                .take_while(|hint| {
-                    hint.position
-                        .cmp(&next_valid_anchor, &buffer_snapshot)
-                        .is_le()
-                })
-                .max_by_key(|hint| hint.id)
-            {
-                if let Some((buffer_anchor, _)) =
-                    buffer_snapshot.anchor_to_buffer_anchor(hovered_hint.position)
-                    && let Some(ResolvedHint::Resolved(cached_hint)) =
-                        lsp_store.update(cx, |lsp_store, cx| {
-                            lsp_store.resolved_hint(buffer_anchor.buffer_id, hovered_hint.id, cx)
-                        })
-                {
-                    match cached_hint.resolve_state {
-                        ResolveState::Resolved => {
-                            let original_text = cached_hint.text();
-                            let actual_left_padding =
-                                if cached_hint.padding_left && !original_text.starts_with(" ") {
-                                    1
-                                } else {
-                                    0
-                                };
-                            let actual_right_padding =
-                                if cached_hint.padding_right && !original_text.ends_with(" ") {
-                                    1
-                                } else {
-                                    0
-                                };
-                            match cached_hint.label {
-                                InlayHintLabel::String(_) => {
-                                    if let Some(tooltip) = cached_hint.tooltip {
-                                        hover_popover::hover_at_inlay(
-                                            self,
-                                            InlayHover {
-                                                tooltip: match tooltip {
-                                                    InlayHintTooltip::String(text) => HoverBlock {
-                                                        text,
-                                                        kind: HoverBlockKind::PlainText,
-                                                    },
-                                                    InlayHintTooltip::MarkupContent(content) => {
-                                                        HoverBlock {
-                                                            text: content.value,
-                                                            kind: content.kind,
-                                                        }
-                                                    }
-                                                },
-                                                range: InlayHighlight {
-                                                    inlay: hovered_hint.id,
-                                                    inlay_position: hovered_hint.position,
-                                                    range: actual_left_padding
-                                                        ..hovered_hint.text().len()
-                                                            - actual_right_padding,
-                                                },
-                                            },
-                                            window,
-                                            cx,
-                                        );
-                                        hover_updated = true;
-                                    }
-                                }
-                                InlayHintLabel::LabelParts(label_parts) => {
-                                    let hint_start =
-                                        snapshot.anchor_to_inlay_offset(hovered_hint.position);
-                                    let content_start =
-                                        InlayOffset(hint_start.0 + actual_left_padding);
-                                    if let Some((hovered_hint_part, part_range)) =
-                                        hover_popover::find_hovered_hint_part(
-                                            label_parts,
-                                            content_start,
-                                            hovered_offset,
-                                        )
-                                    {
-                                        let highlight_start = part_range.start - hint_start;
-                                        let highlight_end = part_range.end - hint_start;
-                                        let highlight = InlayHighlight {
-                                            inlay: hovered_hint.id,
-                                            inlay_position: hovered_hint.position,
-                                            range: highlight_start..highlight_end,
-                                        };
-                                        if let Some((server_id, command)) =
-                                            hovered_hint_part.command
-                                            && let Some(inlay_hints) = self.inlay_hints.as_mut()
-                                        {
-                                            inlay_command_updated = true;
-                                            inlay_hints.hovered_command =
-                                                Some(HoveredInlayHintCommand {
-                                                    highlight: highlight.clone(),
-                                                    buffer_id: buffer_anchor.buffer_id,
-                                                    action: CodeAction {
-                                                        server_id,
-                                                        range: cached_hint.position
-                                                            ..cached_hint.position,
-                                                        lsp_action: LspAction::Command(command),
-                                                        resolved: true,
-                                                    },
-                                                });
-                                        }
-                                        if let Some(tooltip) = hovered_hint_part.tooltip {
-                                            hover_popover::hover_at_inlay(
-                                                self,
-                                                InlayHover {
-                                                    tooltip: match tooltip {
-                                                        InlayHintLabelPartTooltip::String(text) => {
-                                                            HoverBlock {
-                                                                text,
-                                                                kind: HoverBlockKind::PlainText,
-                                                            }
-                                                        }
-                                                        InlayHintLabelPartTooltip::MarkupContent(
-                                                            content,
-                                                        ) => HoverBlock {
-                                                            text: content.value,
-                                                            kind: content.kind,
-                                                        },
-                                                    },
-                                                    range: highlight.clone(),
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                            hover_updated = true;
-                                        }
-                                        if let Some((language_server_id, location)) =
-                                            hovered_hint_part.location
-                                            && secondary_held
-                                            && !self.has_pending_nonempty_selection()
-                                        {
-                                            go_to_definition_updated = true;
-                                            show_link_definition(
-                                                shift_held,
-                                                self,
-                                                TriggerPoint::InlayHint(
-                                                    highlight,
-                                                    location,
-                                                    language_server_id,
-                                                ),
-                                                snapshot,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    }
-                                }
-                            };
-                        }
-                        ResolveState::CanResolve(_, _) => debug_panic!(
-                            "Expected resolved_hint retrieval to return a resolved hint"
-                        ),
-                        ResolveState::Resolving => {}
-                    }
-                }
+        if let ResolvedHint::Resolving(_) = &resolved_hint {
+            self.hide_hovered_link(cx);
+            hover_popover::hover_at(self, None, mouse_position, window, cx);
+            if let Some(inlay_hints) = self.inlay_hints.as_mut() {
+                inlay_hints.hovered_command = None;
             }
         }
+        let scroll_position = snapshot.scroll_position();
+        let update_hover = move |editor: &mut Editor,
+                                 window: &mut Window,
+                                 cx: &mut Context<Self>,
+                                 cached_hint: InlayHint,
+                                 secondary_held: bool,
+                                 shift_held: bool| {
+            let snapshot = editor.snapshot(window, cx);
+            if snapshot.scroll_position() != scroll_position
+                || !editor.lsp_data_enabled()
+                || !editor
+                    .inlay_hints
+                    .as_ref()
+                    .is_some_and(|hints| hints.added_hints.contains_key(&hint_id))
+            {
+                return;
+            }
+            let Some((hovered_hint, offset_in_hint)) = hint_glyph
+                .and_then(|glyph| snapshot.inlay_hint_at(glyph))
+                .filter(|(hint, _)| hint.id == hint_id)
+            else {
+                return;
+            };
+            let mut go_to_definition_updated = false;
+            let mut hover_updated = false;
+            let mut inlay_command_updated = false;
+            let original_text = cached_hint.text();
+            let actual_left_padding = if cached_hint.padding_left && !original_text.starts_with(" ")
+            {
+                1
+            } else {
+                0
+            };
+            let actual_right_padding = if cached_hint.padding_right && !original_text.ends_with(" ")
+            {
+                1
+            } else {
+                0
+            };
+            match cached_hint.label {
+                InlayHintLabel::String(_) => {
+                    if let Some(tooltip) = cached_hint.tooltip {
+                        hover_popover::hover_at_inlay(
+                            editor,
+                            InlayHover {
+                                tooltip: match tooltip {
+                                    InlayHintTooltip::String(text) => HoverBlock {
+                                        text,
+                                        kind: HoverBlockKind::PlainText,
+                                    },
+                                    InlayHintTooltip::MarkupContent(content) => HoverBlock {
+                                        text: content.value,
+                                        kind: content.kind,
+                                    },
+                                },
+                                range: InlayHighlight {
+                                    inlay: hovered_hint.id,
+                                    inlay_position: hovered_hint.position,
+                                    range: actual_left_padding
+                                        ..hovered_hint.text().len() - actual_right_padding,
+                                },
+                            },
+                            window,
+                            cx,
+                        );
+                        hover_updated = true;
+                    }
+                }
+                InlayHintLabel::LabelParts(label_parts) => {
+                    if let Some(offset_in_label) = offset_in_hint.checked_sub(actual_left_padding)
+                        && let Some((hovered_hint_part, part_range)) =
+                            hover_popover::find_hovered_hint_part(label_parts, offset_in_label)
+                    {
+                        let highlight_start = actual_left_padding + part_range.start;
+                        let highlight_end = actual_left_padding + part_range.end;
+                        let highlight = InlayHighlight {
+                            inlay: hovered_hint.id,
+                            inlay_position: hovered_hint.position,
+                            range: highlight_start..highlight_end,
+                        };
+                        if let Some((server_id, command)) = hovered_hint_part.command
+                            && let Some(inlay_hints) = editor.inlay_hints.as_mut()
+                        {
+                            inlay_command_updated = true;
+                            inlay_hints.hovered_command = Some(HoveredInlayHintCommand {
+                                highlight: highlight.clone(),
+                                buffer_id,
+                                action: CodeAction {
+                                    server_id,
+                                    range: cached_hint.position..cached_hint.position,
+                                    lsp_action: LspAction::Command(command),
+                                    resolved: true,
+                                },
+                            });
+                        }
+                        if let Some(tooltip) = hovered_hint_part.tooltip {
+                            hover_popover::hover_at_inlay(
+                                editor,
+                                InlayHover {
+                                    tooltip: match tooltip {
+                                        InlayHintLabelPartTooltip::String(text) => HoverBlock {
+                                            text,
+                                            kind: HoverBlockKind::PlainText,
+                                        },
+                                        InlayHintLabelPartTooltip::MarkupContent(content) => {
+                                            HoverBlock {
+                                                text: content.value,
+                                                kind: content.kind,
+                                            }
+                                        }
+                                    },
+                                    range: highlight.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                            hover_updated = true;
+                        }
+                        if let Some((language_server_id, location)) = hovered_hint_part.location
+                            && secondary_held
+                            && !editor.has_pending_nonempty_selection()
+                        {
+                            go_to_definition_updated = true;
+                            show_link_definition(
+                                shift_held,
+                                editor,
+                                TriggerPoint::InlayHint(highlight, location, language_server_id),
+                                &snapshot,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
+            };
 
-        if !go_to_definition_updated {
-            self.hide_hovered_link(cx)
-        }
-        if !hover_updated {
-            hover_popover::hover_at(self, None, mouse_position, window, cx);
-        }
-        if !inlay_command_updated && let Some(inlay_hints) = self.inlay_hints.as_mut() {
-            inlay_hints.hovered_command = None;
+            if !go_to_definition_updated {
+                editor.hide_hovered_link(cx);
+            }
+            if !hover_updated {
+                hover_popover::hover_at(editor, None, mouse_position, window, cx);
+            }
+            if !inlay_command_updated && let Some(inlay_hints) = editor.inlay_hints.as_mut() {
+                inlay_hints.hovered_command = None;
+            }
+        };
+        match resolved_hint {
+            ResolvedHint::Resolved(hint) => {
+                update_hover(self, window, cx, hint, secondary_held, shift_held)
+            }
+            ResolvedHint::Resolving(task) => {
+                self.hover_state.hovered_hint_resolve_task =
+                    Some(cx.spawn_in(window, async move |editor, cx| {
+                        let Some(hint) = task.await else {
+                            return;
+                        };
+                        editor
+                            .update_in(cx, |editor, window, cx| {
+                                let modifiers = window.modifiers();
+                                let secondary_held = Editor::is_cmd_or_ctrl_pressed(&modifiers, cx);
+                                update_hover(
+                                    editor,
+                                    window,
+                                    cx,
+                                    hint,
+                                    secondary_held,
+                                    modifiers.shift,
+                                )
+                            })
+                            .ok();
+                    }));
+            }
         }
     }
 
@@ -839,12 +1174,12 @@ impl Editor {
     pub(crate) fn activate_hovered_inlay_hint_command(
         &mut self,
         snapshot: &EditorSnapshot,
-        down: PointForPosition,
-        up: PointForPosition,
+        down: Option<DisplayPoint>,
+        up: Option<DisplayPoint>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(state) = self.hovered_inlay_hint_command().filter(|state| {
-            state.contains_point(snapshot, down) && state.contains_point(snapshot, up)
+            state.contains_glyph(snapshot, down) && state.contains_glyph(snapshot, up)
         }) else {
             return false;
         };
@@ -1009,10 +1344,7 @@ impl Editor {
             .filter(|(hint_id, lsp_hint)| {
                 should_show
                     && inlay_hints.allowed_hint_kinds.contains(&lsp_hint.kind)
-                    && inlay_hints
-                        .added_hints
-                        .insert(*hint_id, lsp_hint.kind)
-                        .is_none()
+                    && !inlay_hints.added_hints.contains_key(hint_id)
             })
             .sorted_by(|(_, a), (_, b)| a.position.cmp(&b.position, &buffer_snapshot))
             .collect::<Vec<_>>();
@@ -1042,7 +1374,20 @@ impl Editor {
         }
 
         self.splice_inlays(&hints_to_remove, hints_to_insert, cx);
+        if let Some(inlay_hints) = &mut self.inlay_hints {
+            inlay_hints.added_hints.extend(
+                new_hints
+                    .into_iter()
+                    .map(|(hint_id, lsp_hint)| (hint_id, lsp_hint.kind)),
+            );
+        }
     }
+}
+
+struct HintTextEdit {
+    offsets: Range<usize>,
+    range: Range<text::Anchor>,
+    new_text: String,
 }
 
 #[derive(Debug)]
@@ -1115,7 +1460,7 @@ pub mod tests {
     use crate::inlays::inlay_hints::InlayHintRefreshReason;
     use crate::scroll::Autoscroll;
     use crate::scroll::ScrollAmount;
-    use crate::{Editor, SelectionEffects};
+    use crate::{AcceptInlayHint, Editor, SelectionEffects};
     use collections::HashSet;
     use futures::channel::oneshot;
     use futures::{StreamExt, future};
@@ -4929,12 +5274,18 @@ let c = 3;"#
                                     server_b_request_count.fetch_add(1, Ordering::Release) + 1;
                                 async move {
                                     Ok(Some(vec![lsp::InlayHint {
-                                        position: lsp::Position::new(0, 22),
+                                        position: lsp::Position::new(0, 17),
                                         label: lsp::InlayHintLabel::String(format!(
                                             "server_b_{count}"
                                         )),
                                         kind: Some(lsp::InlayHintKind::TYPE),
-                                        text_edits: None,
+                                        text_edits: Some(vec![lsp::TextEdit {
+                                            range: lsp::Range::new(
+                                                lsp::Position::new(0, 17),
+                                                lsp::Position::new(0, 17),
+                                            ),
+                                            new_text: ": u32".to_string(),
+                                        }]),
                                         tooltip: None,
                                         padding_left: None,
                                         padding_right: None,
@@ -5024,6 +5375,217 @@ let c = 3;"#
                 );
             })
             .unwrap();
+
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(0, 17)..Point::new(0, 17)]);
+                });
+                assert!(editor.can_accept_inlay_hint(cx));
+                editor
+                    .inlay_hints
+                    .as_mut()
+                    .expect("inlay hints enabled")
+                    .invalidate_debounce = Some(Duration::from_secs(1));
+                editor.accept_inlay_hint(&AcceptInlayHint, window, cx);
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        editor
+            .update(cx, |editor, _, cx| {
+                assert_eq!(
+                    editor.text(cx),
+                    "fn main() { let x: u32 = 1; } // padding to keep hints from being trimmed",
+                );
+                assert_eq!(
+                    visible_hint_labels(editor, cx),
+                    vec![format!(
+                        "server_a_{}",
+                        server_a_request_count.load(Ordering::Acquire)
+                    )],
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_accept_inlay_hints_across_buffers(cx: &mut gpui::TestAppContext) {
+        init_test(cx, &|settings| {
+            settings.defaults.inlay_hints = Some(InlayHintSettingsContent {
+                enabled: Some(true),
+                edit_debounce_ms: Some(0),
+                scroll_debounce_ms: Some(0),
+                ..InlayHintSettingsContent::default()
+            })
+        });
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/a"),
+            json!({
+                "first.rs": "fn first() { let a = 1; }\n",
+                "second.rs": "fn second() { let b = 2; }\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+        let resolve_gate = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    inlay_hint_provider: Some(lsp::OneOf::Right(
+                        lsp::InlayHintServerCapabilities::Options(lsp::InlayHintOptions {
+                            resolve_provider: Some(true),
+                            ..lsp::InlayHintOptions::default()
+                        }),
+                    )),
+                    ..lsp::ServerCapabilities::default()
+                },
+                initializer: Some(Box::new({
+                    let resolve_gate = resolve_gate.clone();
+                    move |server| {
+                        server.set_request_handler::<lsp::request::InlayHintRequest, _, _>(
+                            move |params, _| async move {
+                                let eager =
+                                    params.text_document.uri.to_string().ends_with("first.rs");
+                                let (column, type_name) =
+                                    if eager { (18, "u32") } else { (19, "u64") };
+                                let position = lsp::Position::new(0, column);
+                                Ok(Some(vec![lsp::InlayHint {
+                                    position,
+                                    label: lsp::InlayHintLabel::String(format!(": {type_name}")),
+                                    kind: Some(lsp::InlayHintKind::TYPE),
+                                    text_edits: eager.then(|| {
+                                        vec![lsp::TextEdit {
+                                            range: lsp::Range::new(position, position),
+                                            new_text: format!(": {type_name}"),
+                                        }]
+                                    }),
+                                    tooltip: None,
+                                    padding_left: None,
+                                    padding_right: None,
+                                    data: None,
+                                }]))
+                            },
+                        );
+                        let resolve_gate = resolve_gate.clone();
+                        server.set_request_handler::<lsp::request::InlayHintResolveRequest, _, _>(
+                            move |mut hint, _| {
+                                let resolve_gate = resolve_gate.lock().take();
+                                hint.text_edits = Some(vec![lsp::TextEdit {
+                                    range: lsp::Range::new(hint.position, hint.position),
+                                    new_text: ": u64".to_string(),
+                                }]);
+                                async move {
+                                    if let Some(resolve_gate) = resolve_gate {
+                                        resolve_gate.await?;
+                                    }
+                                    Ok(hint)
+                                }
+                            },
+                        );
+                    }
+                })),
+                ..FakeLspAdapter::default()
+            },
+        );
+        let (first_buffer, _first_handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/a/first.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let (second_buffer, _second_handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/a/second.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let multi_buffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            multibuffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                first_buffer.clone(),
+                [Point::new(0, 0)..Point::new(1, 0)],
+                0,
+                cx,
+            );
+            multibuffer.set_excerpts_for_path(
+                PathKey::sorted(1),
+                second_buffer.clone(),
+                [Point::new(0, 0)..Point::new(1, 0)],
+                0,
+                cx,
+            );
+            multibuffer
+        });
+        let editor = cx.add_window(|window, cx| {
+            Editor::for_multibuffer(multi_buffer, Some(project.clone()), window, cx)
+        });
+        let _fake_server = fake_servers.next().await.unwrap();
+        cx.executor().run_until_parked();
+        editor
+            .update(cx, |editor, _, cx| {
+                assert_eq!(visible_hint_labels(editor, cx), vec![": u32", ": u64"]);
+            })
+            .unwrap();
+
+        let (release_resolve, gate) = oneshot::channel();
+        *resolve_gate.lock() = Some(gate);
+        editor
+            .update(cx, |editor, window, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let first_hint = snapshot.text().find("a = 1").expect("first hint anchor") + 1;
+                let second_hint = snapshot.text().find("b = 2").expect("second hint anchor") + 1;
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([
+                        MultiBufferOffset(first_hint)..MultiBufferOffset(first_hint),
+                        MultiBufferOffset(second_hint)..MultiBufferOffset(second_hint),
+                    ]);
+                });
+                editor.accept_inlay_hint(&AcceptInlayHint, window, cx);
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        let buffer_texts = |cx: &mut TestAppContext| {
+            (
+                first_buffer.read_with(cx, |buffer, _| buffer.text()),
+                second_buffer.read_with(cx, |buffer, _| buffer.text()),
+            )
+        };
+        assert_eq!(
+            buffer_texts(cx),
+            (
+                "fn first() { let a = 1; }\n".to_string(),
+                "fn second() { let b = 2; }\n".to_string()
+            ),
+            "nothing applies before the whole batch resolved"
+        );
+        release_resolve.send(()).expect("pending resolve gate");
+        cx.executor().run_until_parked();
+        assert_eq!(
+            buffer_texts(cx),
+            (
+                "fn first() { let a: u32 = 1; }\n".to_string(),
+                "fn second() { let b: u64 = 2; }\n".to_string()
+            )
+        );
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.undo(&crate::Undo, window, cx)
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        assert_eq!(
+            buffer_texts(cx),
+            (
+                "fn first() { let a = 1; }\n".to_string(),
+                "fn second() { let b = 2; }\n".to_string()
+            ),
+            "one undo reverts both buffers"
+        );
     }
 
     #[gpui::test]

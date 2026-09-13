@@ -1582,6 +1582,7 @@ impl Editor {
         self.select_syntax_node_history.try_clear();
         self.invalidate_autoclose_regions(&selection_anchors, buffer);
         self.snippet_stack.invalidate(&selection_anchors, buffer);
+        self.refresh_inlay_hints_at_selections(buffer, cx);
         self.take_rename(false, window, cx);
         self.take_inline_input(window, cx);
 

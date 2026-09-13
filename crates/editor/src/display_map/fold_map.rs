@@ -884,6 +884,13 @@ impl FoldSnapshot {
         })
     }
 
+    pub fn is_fold_placeholder(&self, point: FoldPoint) -> bool {
+        let (_, _, item) = self
+            .transforms
+            .find::<FoldPoint, _>((), &point, Bias::Right);
+        item.is_some_and(|transform| transform.placeholder.is_some())
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn intersects_fold<T>(&self, offset: T) -> bool
     where
