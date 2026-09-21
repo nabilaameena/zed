@@ -5431,5 +5431,9 @@ mod tests {
             "#},
             None,
         );
+        assert_migrate_settings(
+            r#"{"profiles":{"work":{"settings":{"languages":{"Go":{"soft_wrap":"prefer_line"}}}}}}"#,
+            Some(r#"{"profiles":{"work":{"settings":{"languages":{"Go":{"soft_wrap":"none"}}}}}}"#),
+        );
     }
 }

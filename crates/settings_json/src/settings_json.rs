@@ -131,7 +131,7 @@ pub fn replace_value_in_json_text<T: AsRef<str>>(
             .and_then(|(key_text, key_path_value)| {
                 serde_json::to_string(key_path_value.as_ref())
                     .ok()
-                    .map(|key_path| depth < key_path.len() && key_text == key_path)
+                    .map(|serialized_key| key_text == serialized_key)
             })
             .unwrap_or(false);
 
